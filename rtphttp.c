@@ -9,6 +9,7 @@
  * E. TS 188 字节对齐写入：防止写入撕裂导致花屏
  * F. 发送线程改用非阻塞 + 独立背压检测：writev 阻塞不再持有锁
  * G. [修复] 支持多网卡/VLAN 环境下的精确 IGMP 加组 (ip_mreqn)
+ * H. [优化] 针对 4K 高码率突发，将环形缓冲扩至 64MB 并移除 TCP_CORK 降低延迟
  *
  * 编译：gcc -O2 -o rtp2http rtphttp_v2.c -lpthread
  * 运行：MCAST_IFACE=eth0.45 ./rtp2http
@@ -35,8 +36,8 @@
 #define HTTP_PORT           1997
 #define MAX_EVENTS          128
 
-/* 环形缓冲：16MB，应对 36Mbps × ~3.5s 的突发 */
-#define RING_BUF_SIZE       (16 * 1024 * 1024)
+/* 环形缓冲：修改为 64MB，应对 4K 高码率突发，可缓冲约 14秒 数据 */
+#define RING_BUF_SIZE       (64 * 1024 * 1024)
 
 /* 预缓存门槛：仅用于兜底（智能起播优先） */
 #define PRECACHE_FALLBACK   (512 * 1024)      /* 512KB 兜底，约 110ms@36Mbps */
@@ -558,9 +559,8 @@ int main(void)
                 /* TCP socket 调优 */
                 int sndbuf = TCP_SNDBUF_SIZE;
                 setsockopt(cli_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-                int cork = 1;
-                setsockopt(cli_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-                /* 关闭 Nagle：IPTV 流是连续大块数据，Nagle 无益 */
+                
+                /* 关闭 Nagle：IPTV 流是连续大块数据，Nagle 无益。移除 TCP_CORK 避免发包延迟卡顿 */
                 int nodelay = 1;
                 setsockopt(cli_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
