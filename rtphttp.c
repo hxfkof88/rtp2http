@@ -142,57 +142,55 @@ static void reorder_insert(ReorderBuf *rb, uint16_t seq, const uint8_t *payload,
 ////! FIX: 删除原 reorder_flush；新增带丢包跳过的重新排序冲刷函数
 static void reorder_flush_with_gap_detection(ReorderBuf *rb, Channel *ch) {
     int delivered = 0;
-    uint16_t start_seq = rb->next_seq;
 
     /* 连续包马上交付 */
     while (1) {
         int slot = rb->next_seq & REORDER_MASK;
-        if (!rb->slots[slot].valid || rb->slots[slot].seq != rb->next_seq) {
-            break; // 遇到缺失/乱序包
-        }
+        if (!rb->slots[slot].valid || rb->slots[slot].seq != rb->next_seq)
+            break;
 
         ring_write(ch, rb->slots[slot].data, rb->slots[slot].len);
         rb->slots[slot].valid = 0;
         rb->next_seq++;
         delivered++;
 
-        /* 更新最后投递时间 */
         if (clock_gettime(CLOCK_MONOTONIC, &rb->last_delivery_at) == 0) {
             rb->delivery_timeout_set = 1;
             rb->last_delivery_seq = rb->next_seq - 1;
         }
     }
 
-    if (delivered > 0) {
+    if (delivered > 0)
         rb->packets_delivered += delivered;
-        ////! FIX: 原代码中的条件变量通知移至 process_packet
+
+    /* 检查是否存在未交付的包（任意 valid 槽） */
+    int has_pending = 0;
+    for (int s = 0; s < REORDER_SLOTS; s++) {
+        if (rb->slots[s].valid) {
+            has_pending = 1;
+            break;
+        }
     }
 
-    /* 检查最终是否出现长时间缺口 */
-    if (rb->delivery_timeout_set && rb->count() > 0) {
+    if (rb->delivery_timeout_set && has_pending) {
         struct timespec now;
         if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
             long elapsed_ms = (now.tv_sec - rb->last_delivery_at.tv_sec) * 1000 +
                               (now.tv_nsec - rb->last_delivery_at.tv_nsec) / 1000000;
 
-            /* 若超过阈值，强制跳过缺失包 */
-            uint16_t oldest_queued_seq = rb->next_seq;
             if (elapsed_ms > REORDER_TIMEOUT_MS) {
                 uint16_t seq;
                 int skipped = 0;
                 for (seq = 0; seq < REORDER_SLOTS && seq < REORDER_MAX_PACKETS_BEHIND; seq++) {
                     int slot = (rb->next_seq + seq) & REORDER_MASK;
                     if (rb->slots[slot].valid) {
-                        /* 找到包，强制前移指针并递送 */
                         rb->next_seq += seq;
                         rb->packets_skipped += seq;
-                        // 递送之前间隔里的包（如果有一些）
                         reorder_flush_with_gap_detection(rb, ch);
                         break;
                     }
                 }
 
-                /* 仍无包时，前移一个包并记录跳过 */
                 if (!rb->slots[rb->next_seq & REORDER_MASK].valid) {
                     rb->next_seq++;
                     rb->packets_skipped++;
