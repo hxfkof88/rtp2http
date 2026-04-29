@@ -1,17 +1,15 @@
 /*
- * rtphttp.c — IPTV 组播转 HTTP 代理（完美重构版）
+ * rtp2httpd_single.c — 高性能组播转 HTTP 代理（单文件重构版）
  *
- * 设计参考：stackia/rtp2httpd (https://github.com/stackia/rtp2httpd)
- * 基于 v4.0 完全重写，修复多频道支持、频道管理、连接管理等严重缺陷。
+ * 基于 stackia/rtp2httpd 架构设计，保留原项目的：
+ *   - 频道/客户端分离架构 (stream/connection)
+ *   - epoll 事件驱动模型
+ *   - 缓冲池 (buffer pool) 设计
+ *   - RTP 乱序恢复 (rtp_reorder)
+ *   - IGMP 精确加组
  *
- * 核心修复：
- *   - 频道/客户端完全分离架构，按需维护客户端列表
- *   - 集成 RTP 智能重排序 & 乱序恢复，消灭丢包卡顿
- *   - 实现零拷贝 I/O，大幅降低高并发 CPU 负载
- *   - 完全异步事件驱动，统一处理生命周期，消除段错误
- *
- * 编译：gcc -O2 -o rtp2http rtphttp.c -lpthread
- * 运行：MCAST_IFACE=eth0.45 ./rtp2http
+ * 编译：gcc -O2 -o rtp2httpd rtp2httpd_single.c -lpthread
+ * 运行：./rtp2httpd -p 7099
  *
  * 请求格式：GET /rtp/组播IP:端口 HTTP/1.1
  */
@@ -25,82 +23,61 @@
 #include <time.h>
 #include <fcntl.h>
 #include <signal.h>
-
-#include <arpa/inet.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
-#include <sys/epoll.h>
-#include <sys/ioctl.h>
-#include <sys/timerfd.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <pthread.h>
 
 /* ========================================================================
- * 环境配置常量
+ * 配置常量（可按需调整）
  * ======================================================================== */
-#define HTTP_PORT                    7099
-#define MAX_EVENTS                   512
-/* 缓冲区配置 - 高码率优化 */
-#define RING_BUF_SIZE                (256 * 1024 * 1024) // 256 MB
-#define TCP_SNDBUF_SIZE              (8 * 1024 * 1024)   // 8 MB 发送缓冲
-#define UDP_RCVBUF_SIZE              (32 * 1024 * 1024)  // 32 MB 接收缓冲
-#define CLIENT_READ_CHUNK            (1024 * 1024)       // 1 MB 发送块
-#define TS_PACKET_SIZE               188
-#define REORDER_SLOTS                128                 // 重排窗口大小
-
-/* RTP 重排序超时处理 */
-#define REORDER_DROP_TIMEOUT_MS      500
-#define REORDER_FORCE_FLUSH_MS       2000
-
-/* 频道哈希表大小 */
-#define CHANNEL_HASH_SIZE 256
+#define DEFAULT_PORT                 7099
+#define MAX_EVENTS                   1024
+#define BUFFER_SIZE                  (7 * 188)          // 7个TS包 ≈ 1316字节
+#define BUFFER_POOL_SIZE             4096               // 缓冲区池大小
+#define RING_BUFFER_SIZE_KB          65536              // 64MB 环形缓冲区
+#define SEND_CHUNK_SIZE              (1024 * 1024)      // 1MB 发送块
+#define TCP_SNDBUF_SIZE              (8 * 1024 * 1024)  // 8MB TCP 发送缓冲
+#define UDP_RCVBUF_SIZE              (32 * 1024 * 1024) // 32MB UDP 接收缓冲
+#define REORDER_SLOTS                128                // 重排窗口大小
+#define REORDER_MAX_PACKETS_BEHIND   32
+#define REORDER_TIMEOUT_MS           500
+#define MCAST_TIMEOUT_SEC            30
 
 /* ========================================================================
  * 数据结构定义
  * ======================================================================== */
 
-/* 双向链表通用节点 */
-typedef struct client_node {
-    int fd;
-    volatile int active;
-    volatile int headers_sent;
-    volatile int iframe_locked;
-    volatile int pause_output;
-    volatile int close_requested;
-    pthread_t thread;
-    struct channel *parent;
-    struct client_node *next;
-    struct client_node *prev;
-} client_node_t;
+/* 缓冲池条目 */
+typedef struct buffer_ref {
+    uint8_t  data[BUFFER_SIZE];
+    size_t   data_size;
+    size_t   data_offset;
+    int      refcount;
+    struct buffer_ref *next;
+} buffer_ref_t;
 
-/* 客户端双向链表 */
-typedef struct client_list {
-    client_node_t *head;
-    client_node_t *tail;
-    int count;
-    pthread_mutex_t lock;
-} client_list_t;
-
-/* 高性能无锁环形缓冲区 */
+/* 缓冲池 */
 typedef struct {
-    uint8_t *buffer;
-    size_t   capacity;
-    volatile size_t head __attribute__((aligned(64))); // 写指针
-    volatile size_t tail __attribute__((aligned(64))); // 读指针
-    size_t   write_miss;
-    size_t   total_written;
-} ring_buffer_t;
+    buffer_ref_t *pool;
+    buffer_ref_t *free_list;
+    int           total;
+    int           free_count;
+    pthread_mutex_t lock;
+} buffer_pool_t;
 
 /* RTP 重排序槽位 */
 typedef struct {
-    uint8_t  data[2048];
-    size_t   len;
-    uint16_t seq;
-    int      valid;
+    buffer_ref_t *buf;
+    uint16_t      seq;
+    int           valid;
 } reorder_slot_t;
 
-/* RTP 重排序状态机 */
+/* RTP 重排序缓冲区 */
 typedef struct {
     reorder_slot_t slots[REORDER_SLOTS];
     uint16_t       base_seq;
@@ -112,30 +89,57 @@ typedef struct {
     struct timespec last_flush;
 } reorder_buffer_t;
 
-/* 频道对象（共享数据源） */
-typedef struct channel {
+/* 环形缓冲区（单一生产者/多消费者） */
+typedef struct {
+    uint8_t *buffer;
+    size_t   capacity;
+    volatile size_t head;
+    volatile size_t tail;
+} ring_buffer_t;
+
+/* 前向声明 */
+typedef struct stream_source stream_source_t;
+typedef struct client_conn client_conn_t;
+
+/* 频道源（数据生产者） */
+struct stream_source {
     char             mcast_ip[64];
     int              mcast_port;
-    int              mcast_fd;
-    int              refcount;      // 引用计数
-    int              cleanup;       // 清理标志
-    struct ip_mreqn  mreq;
+    int              mcast_sock;
+    int              refcount;
+    int              cleanup;
     ring_buffer_t    ring;
     reorder_buffer_t reorder;
-    client_list_t    clients;       // 客户端列表
-    pthread_mutex_t  lock;          // 频道锁
-    pthread_cond_t   cond;          // 条件变量，通知消费者有新数据
-    struct channel  *next;          // 哈希表链表指针
-} channel_t;
+    client_conn_t   *clients;
+    int              client_count;
+    pthread_mutex_t  lock;
+    pthread_cond_t   cond;
+    stream_source_t *hash_next;
+};
 
-/* 全局频道查找表 (哈希表) */
-static channel_t *channel_map[CHANNEL_HASH_SIZE];
-static pthread_mutex_t channel_map_lock = PTHREAD_MUTEX_INITIALIZER;
+/* 客户端连接（数据消费者） */
+struct client_conn {
+    int              fd;
+    int              epfd;
+    int              active;
+    int              headers_sent;
+    int              iframe_found;
+    stream_source_t *source;
+    client_conn_t   *next_conn;
+};
+
+/* 频道哈希表 */
+#define CHANNEL_HASH_SIZE 256
+static stream_source_t *channel_table[CHANNEL_HASH_SIZE];
+static pthread_mutex_t channel_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 全局缓冲池 */
+static buffer_pool_t g_pool;
 
 /* ========================================================================
- * 工具函数：时间 & 非阻塞设置
+ * 工具函数
  * ======================================================================== */
-static int64_t now_ms(void) {
+static int64_t get_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -143,102 +147,93 @@ static int64_t now_ms(void) {
 
 static void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags != -1) {
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
-}
-
-static int set_tcp_optimized(int fd) {
-    int opt;
-    /* TCP_NODELAY 禁用 Nagle 算法 */
-    opt = 1;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
-        perror("TCP_NODELAY");
-    }
-    /* TCP_QUICKACK 减少延迟 (Linux) */
-    opt = 1;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &opt, sizeof(opt)) < 0) {
-        // 忽略错误，非必须
-    }
-    /* 增大 TCP 发送缓冲区 */
-    int sndbuf = TCP_SNDBUF_SIZE;
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
-        perror("SO_SNDBUF");
-    }
-    set_nonblocking(fd);
-    return 0;
+    if (flags != -1) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 /* ========================================================================
- * 环形缓冲区：无锁单一生产者/多消费者模型
+ * 缓冲池管理
  * ======================================================================== */
-static int ring_buffer_init(ring_buffer_t *rb, size_t capacity) {
-    rb->buffer = (uint8_t *)malloc(capacity);
+static int buffer_pool_init(buffer_pool_t *bp, int count) {
+    bp->pool = calloc(count, sizeof(buffer_ref_t));
+    if (!bp->pool) return -1;
+    bp->total = count;
+    bp->free_count = count;
+    pthread_mutex_init(&bp->lock, NULL);
+    bp->free_list = NULL;
+    for (int i = 0; i < count; i++) {
+        bp->pool[i].next = bp->free_list;
+        bp->free_list = &bp->pool[i];
+    }
+    return 0;
+}
+
+static buffer_ref_t *buffer_pool_alloc(buffer_pool_t *bp) {
+    pthread_mutex_lock(&bp->lock);
+    if (!bp->free_list) {
+        pthread_mutex_unlock(&bp->lock);
+        return NULL;
+    }
+    buffer_ref_t *buf = bp->free_list;
+    bp->free_list = buf->next;
+    bp->free_count--;
+    pthread_mutex_unlock(&bp->lock);
+    buf->refcount = 1;
+    buf->data_size = 0;
+    buf->data_offset = 0;
+    buf->next = NULL;
+    return buf;
+}
+
+static void buffer_ref_put(buffer_pool_t *bp, buffer_ref_t *buf) {
+    if (!buf) return;
+    pthread_mutex_lock(&bp->lock);
+    buf->next = bp->free_list;
+    bp->free_list = buf;
+    bp->free_count++;
+    pthread_mutex_unlock(&bp->lock);
+}
+
+/* ========================================================================
+ * 环形缓冲区（无锁单一生产者/多消费者）
+ * ======================================================================== */
+static int ring_buffer_init_capacity(ring_buffer_t *rb, size_t capacity) {
+    rb->buffer = malloc(capacity);
     if (!rb->buffer) return -1;
     rb->capacity = capacity;
     rb->head = 0;
     rb->tail = 0;
-    rb->write_miss = 0;
-    rb->total_written = 0;
     return 0;
 }
 
-static void ring_buffer_destroy(ring_buffer_t *rb) {
-    free(rb->buffer);
-    rb->buffer = NULL;
-}
-
-/* 生产者：写入数据，若空间不足则丢弃整个对齐块 */
 static void ring_buffer_write(ring_buffer_t *rb, const uint8_t *data, size_t len) {
     if (len == 0) return;
-    /* 计算可用空间 */
     size_t h = __atomic_load_n(&rb->head, __ATOMIC_ACQUIRE);
     size_t t = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
     size_t free_space = (t > h) ? (t - h - 1) : (rb->capacity - h + t - 1);
-
-    if (len > free_space) {
-        __atomic_fetch_add(&rb->write_miss, 1, __ATOMIC_RELAXED);
-        return;
-    }
-
-    size_t first_part = rb->capacity - h;
-    if (len <= first_part) {
+    if (len > free_space) return;
+    size_t first = rb->capacity - h;
+    if (len <= first) {
         memcpy(rb->buffer + h, data, len);
     } else {
-        memcpy(rb->buffer + h, data, first_part);
-        memcpy(rb->buffer, data + first_part, len - first_part);
+        memcpy(rb->buffer + h, data, first);
+        memcpy(rb->buffer, data + first, len - first);
     }
-
     __atomic_store_n(&rb->head, (h + len) % rb->capacity, __ATOMIC_RELEASE);
-    __atomic_fetch_add(&rb->total_written, len, __ATOMIC_RELAXED);
 }
 
-/* 消费者：获取当前可读数据指针与长度（零拷贝） */
-static size_t ring_buffer_get_read_ptr(ring_buffer_t *rb, const uint8_t **ptr1, size_t *len1, const uint8_t **ptr2, size_t *len2) {
+static size_t ring_buffer_readable(ring_buffer_t *rb, const uint8_t **p1, size_t *l1,
+                                   const uint8_t **p2, size_t *l2) {
     size_t h = __atomic_load_n(&rb->head, __ATOMIC_ACQUIRE);
     size_t t = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
-
-    if (h == t) {
-        *len1 = 0;
-        *len2 = 0;
-        return 0;
-    }
-
-    size_t avail;
+    if (h == t) { *l1 = 0; *l2 = 0; return 0; }
     if (h > t) {
-        avail = h - t;
-        *ptr1 = rb->buffer + t;
-        *len1 = avail;
-        *ptr2 = NULL;
-        *len2 = 0;
+        *p1 = rb->buffer + t; *l1 = h - t; *p2 = NULL; *l2 = 0;
+        return h - t;
     } else {
-        avail = rb->capacity - t + h;
-        *ptr1 = rb->buffer + t;
-        *len1 = rb->capacity - t;
-        *ptr2 = rb->buffer;
-        *len2 = h;
+        *p1 = rb->buffer + t; *l1 = rb->capacity - t;
+        *p2 = rb->buffer; *l2 = h;
+        return rb->capacity - t + h;
     }
-    return avail;
 }
 
 static void ring_buffer_consume(ring_buffer_t *rb, size_t len) {
@@ -247,45 +242,75 @@ static void ring_buffer_consume(ring_buffer_t *rb, size_t len) {
 }
 
 /* ========================================================================
- * RTP 重排序：滑动窗口 + 乱序恢复
+ * RTP 解包与检测
  * ======================================================================== */
-static void reorder_buffer_init(reorder_buffer_t *rb) {
-    memset(rb, 0, sizeof(*rb));
+static int rtp_get_payload(const uint8_t *pkt, size_t n,
+                           const uint8_t **payload, size_t *payload_len, uint16_t *seq) {
+    /* 纯 TS 流检测 */
+    if (n >= 188 && pkt[0] == 0x47) {
+        *payload = pkt;
+        *payload_len = n;
+        return 0; // 非 RTP
+    }
+    /* RTP 头检测 */
+    if (n > 12 && (pkt[0] & 0xC0) == 0x80) {
+        *seq = ((uint16_t)pkt[2] << 8) | pkt[3];
+        int cc = pkt[0] & 0x0F;
+        size_t offset = 12 + cc * 4;
+        if ((pkt[0] & 0x10) && n >= offset + 4) {
+            offset += 4 + ((((int)pkt[offset + 2] << 8) | pkt[offset + 3]) * 4);
+        }
+        if (offset < n && pkt[offset] == 0x47) {
+            *payload = pkt + offset;
+            *payload_len = n - offset;
+            return 1; // RTP
+        }
+    }
+    return -1; // 无效包
 }
 
 static int ts_has_pusi(const uint8_t *payload, size_t len) {
-    for (size_t off = 0; off + TS_PACKET_SIZE <= len; off += TS_PACKET_SIZE) {
-        if (payload[off] == 0x47 && (payload[off + 1] & 0x40)) {
-            return 1;
-        }
+    for (size_t off = 0; off + 188 <= len; off += 188) {
+        if (payload[off] == 0x47 && (payload[off + 1] & 0x40)) return 1;
     }
     return 0;
 }
 
-static void reorder_force_flush(reorder_buffer_t *rb, channel_t *ch) {
-    if (!rb->initialized || !rb->stable) return;
+/* ========================================================================
+ * RTP 重排序（带丢包跳过）
+ * ======================================================================== */
+static void reorder_init(reorder_buffer_t *rb) {
+    memset(rb, 0, sizeof(*rb));
+}
+
+static void reorder_force_flush(reorder_buffer_t *rb, stream_source_t *source) {
+    if (!rb->stable) return;
     int flushed = 0;
     while (1) {
         int slot = rb->base_seq % REORDER_SLOTS;
         if (!rb->slots[slot].valid) break;
-        ring_buffer_write(&ch->ring, rb->slots[slot].data, rb->slots[slot].len);
+        buffer_ref_t *buf = rb->slots[slot].buf;
+        ring_buffer_write(&source->ring, buf->data + buf->data_offset, buf->data_size);
+        buffer_ref_put(&g_pool, buf);
         rb->slots[slot].valid = 0;
         rb->base_seq++;
         flushed++;
     }
     if (flushed > 0) {
         rb->delivered += flushed;
-        pthread_cond_broadcast(&ch->cond);
+        pthread_cond_broadcast(&source->cond);
     }
 }
 
-static void reorder_deliver(reorder_buffer_t *rb, channel_t *ch) {
+static void reorder_deliver(reorder_buffer_t *rb, stream_source_t *source) {
     if (!rb->initialized) return;
     int delivered = 0;
     while (1) {
         int slot = rb->base_seq % REORDER_SLOTS;
         if (!rb->slots[slot].valid || rb->slots[slot].seq != rb->base_seq) break;
-        ring_buffer_write(&ch->ring, rb->slots[slot].data, rb->slots[slot].len);
+        buffer_ref_t *buf = rb->slots[slot].buf;
+        ring_buffer_write(&source->ring, buf->data + buf->data_offset, buf->data_size);
+        buffer_ref_put(&g_pool, buf);
         rb->slots[slot].valid = 0;
         rb->base_seq++;
         delivered++;
@@ -293,486 +318,340 @@ static void reorder_deliver(reorder_buffer_t *rb, channel_t *ch) {
     if (delivered > 0) {
         rb->delivered += delivered;
         rb->stable = 1;
-        pthread_cond_broadcast(&ch->cond);
         clock_gettime(CLOCK_MONOTONIC, &rb->last_flush);
+        pthread_cond_broadcast(&source->cond);
     }
-
-    /* 超时兜底：超过 REORDER_DROP_TIMEOUT_MS 未收到期望包，主动跳过 */
+    /* 丢包跳过检查 */
     if (rb->stable) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t elapsed = (now.tv_sec - rb->last_flush.tv_sec) * 1000 + (now.tv_nsec - rb->last_flush.tv_nsec) / 1000000;
-        if (elapsed > REORDER_DROP_TIMEOUT_MS) {
-            /* 检查期望包是否还未到达 */
+        int64_t elapsed = (now.tv_sec - rb->last_flush.tv_sec) * 1000 +
+                          (now.tv_nsec - rb->last_flush.tv_nsec) / 1000000;
+        if (elapsed > REORDER_TIMEOUT_MS) {
             int exp_slot = rb->base_seq % REORDER_SLOTS;
             if (!rb->slots[exp_slot].valid || rb->slots[exp_slot].seq != rb->base_seq) {
-                /* 跳过缺失的包 */
                 rb->base_seq++;
                 rb->skipped++;
-                reorder_deliver(rb, ch);
+                reorder_deliver(rb, source);
             }
         }
     }
 }
 
-static void reorder_insert_packet(reorder_buffer_t *rb, channel_t *ch, uint16_t seq, const uint8_t *payload, size_t len) {
-    if (!rb->initialized) {
-        rb->base_seq = seq;
-        rb->initialized = 1;
-    }
-
-    /* 拒绝过旧的包 */
+static void reorder_insert(reorder_buffer_t *rb, stream_source_t *source,
+                           buffer_ref_t *buf, uint16_t seq) {
+    if (!rb->initialized) { rb->base_seq = seq; rb->initialized = 1; }
     if (rb->stable) {
         uint16_t diff = seq - rb->base_seq;
-        if (diff > 0x8000) { // 包太旧了
-            return;
-        }
+        if (diff > 0x8000) { buffer_ref_put(&g_pool, buf); return; }
         if (diff >= REORDER_SLOTS) {
-            /* 跳跃过大，强制冲刷当前窗口 */
-            reorder_force_flush(rb, ch);
+            reorder_force_flush(rb, source);
             rb->base_seq = seq;
         }
     }
-
     int slot = seq % REORDER_SLOTS;
     if (rb->slots[slot].valid && rb->slots[slot].seq == seq) {
-        return; // 重复包
+        buffer_ref_put(&g_pool, buf); return;
     }
-
-    memcpy(rb->slots[slot].data, payload, len);
-    rb->slots[slot].len = len;
+    rb->slots[slot].buf = buf;
     rb->slots[slot].seq = seq;
     rb->slots[slot].valid = 1;
-
-    reorder_deliver(rb, ch);
+    reorder_deliver(rb, source);
 }
 
 /* ========================================================================
- * 频道管理 (完全重写：基于哈希表 + 链表法)
+ * 频道管理
  * ======================================================================== */
 static unsigned int channel_hash(const char *ip, int port) {
     unsigned int hash = 5381;
     while (*ip) hash = ((hash << 5) + hash) + *ip++;
-    hash = ((hash << 5) + hash) + port;
-    return hash % CHANNEL_HASH_SIZE;
+    return (hash + port) % CHANNEL_HASH_SIZE;
 }
 
-static channel_t *channel_find_or_create(const char *ip, int port, int epoll_fd) {
+static stream_source_t *channel_find_or_create(const char *ip, int port, int epfd) {
     unsigned int h = channel_hash(ip, port);
-    pthread_mutex_lock(&channel_map_lock);
+    pthread_mutex_lock(&channel_lock);
 
-    /* 1. 在哈希表的链表中查找已存在的频道 */
-    channel_t *ch = channel_map[h];
+    /* 查找已有频道 */
+    stream_source_t *ch = channel_table[h];
     while (ch) {
-        if (strcmp(ch->mcast_ip, ip) == 0 && ch->mcast_port == port) {
-            if (!ch->cleanup) {
-                ch->refcount++;
-                pthread_mutex_unlock(&channel_map_lock);
-                printf("🔗 频道 [%s:%d] 复用成功, 当前引用计数: %d\n", ip, port, ch->refcount);
-                return ch;
-            }
+        if (strcmp(ch->mcast_ip, ip) == 0 && ch->mcast_port == port && !ch->cleanup) {
+            ch->refcount++;
+            pthread_mutex_unlock(&channel_lock);
+            printf("🔗 复用频道 %s:%d (ref=%d)\n", ip, port, ch->refcount);
+            return ch;
         }
-        ch = ch->next;
+        ch = ch->hash_next;
     }
 
-    /* 2. 创建新频道 */
-    ch = calloc(1, sizeof(channel_t));
-    if (!ch) {
-        pthread_mutex_unlock(&channel_map_lock);
-        return NULL;
-    }
+    /* 创建新频道 */
+    ch = calloc(1, sizeof(stream_source_t));
+    if (!ch) { pthread_mutex_unlock(&channel_lock); return NULL; }
 
     strncpy(ch->mcast_ip, ip, sizeof(ch->mcast_ip) - 1);
     ch->mcast_port = port;
     ch->refcount = 1;
-    ch->cleanup = 0;
     pthread_mutex_init(&ch->lock, NULL);
     pthread_cond_init(&ch->cond, NULL);
-    ring_buffer_init(&ch->ring, RING_BUF_SIZE);
-    reorder_buffer_init(&ch->reorder);
-    pthread_mutex_init(&ch->clients.lock, NULL);
+    ring_buffer_init_capacity(&ch->ring, RING_BUFFER_SIZE_KB * 1024);
+    reorder_init(&ch->reorder);
 
-    /* 3. 创建组播 socket 并加入组播组 */
-    ch->mcast_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (ch->mcast_fd < 0) {
-        perror("socket");
-        goto create_error;
+    /* 创建组播 socket */
+    ch->mcast_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ch->mcast_sock < 0) {
+        perror("mcast socket"); free(ch); pthread_mutex_unlock(&channel_lock); return NULL;
     }
 
     int opt = 1;
-    setsockopt(ch->mcast_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(ch->mcast_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(ch->mcast_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(ch->mcast_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = inet_addr(ip);
-    if (bind(ch->mcast_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        goto create_error;
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(port),
+                               .sin_addr.s_addr = inet_addr(ip)};
+    if (bind(ch->mcast_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("mcast bind"); close(ch->mcast_sock); free(ch);
+        pthread_mutex_unlock(&channel_lock); return NULL;
     }
 
     const char *iface = getenv("MCAST_IFACE") ? getenv("MCAST_IFACE") : "eth0";
     struct ifreq ifr = {0};
     strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
-    setsockopt(ch->mcast_fd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr));
+    setsockopt(ch->mcast_sock, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr));
 
-    struct ip_mreqn mreq = {0};
-    mreq.imr_multiaddr.s_addr = inet_addr(ip);
-    mreq.imr_address.s_addr = htonl(INADDR_ANY);
-    mreq.imr_ifindex = if_nametoindex(iface);
-    if (setsockopt(ch->mcast_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        perror("IP_ADD_MEMBERSHIP");
-        goto create_error;
-    }
-    ch->mreq = mreq;
+    struct ip_mreqn mreq = {.imr_multiaddr.s_addr = inet_addr(ip),
+                            .imr_address.s_addr = htonl(INADDR_ANY),
+                            .imr_ifindex = if_nametoindex(iface)};
+    setsockopt(ch->mcast_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
     int rcvbuf = UDP_RCVBUF_SIZE;
-    setsockopt(ch->mcast_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    set_nonblocking(ch->mcast_fd);
+    setsockopt(ch->mcast_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    set_nonblocking(ch->mcast_sock);
 
-    /* 4. 将新频道添加到哈希表 (链表头) */
-    ch->next = channel_map[h];
-    channel_map[h] = ch;
+    /* 添加到 epoll */
+    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = NULL};
+    ev.data.fd = ch->mcast_sock;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, ch->mcast_sock, &ev);
 
-    pthread_mutex_unlock(&channel_map_lock);
-    printf("📡 新频道 [%s:%d] 已创建\n", ip, port);
+    /* 插入哈希表 */
+    ch->hash_next = channel_table[h];
+    channel_table[h] = ch;
+    pthread_mutex_unlock(&channel_lock);
+
+    printf("📡 新频道 %s:%d 创建成功 (fd=%d)\n", ip, port, ch->mcast_sock);
     return ch;
-
-create_error:
-    if (ch->mcast_fd >= 0) close(ch->mcast_fd);
-    free(ch);
-    pthread_mutex_unlock(&channel_map_lock);
-    return NULL;
 }
 
-static void channel_unref(channel_t *ch) {
-    pthread_mutex_lock(&channel_map_lock);
-    ch->refcount--;
-    if (ch->refcount <= 0) {
-        ch->cleanup = 1;
-        /* 实际的清理将在主线程安全进行 */
+static void channel_unref(stream_source_t *source, int epfd) {
+    pthread_mutex_lock(&channel_lock);
+    source->refcount--;
+    if (source->refcount <= 0) {
+        source->cleanup = 1;
+        /* 从哈希表移除 */
+        unsigned int h = channel_hash(source->mcast_ip, source->mcast_port);
+        stream_source_t **pp = &channel_table[h];
+        while (*pp) {
+            if (*pp == source) { *pp = source->hash_next; break; }
+            pp = &(*pp)->hash_next;
+        }
+        /* 关闭组播 socket */
+        epoll_ctl(epfd, EPOLL_CTL_DEL, source->mcast_sock, NULL);
+        close(source->mcast_sock);
+        free(source->ring.buffer);
+        pthread_mutex_destroy(&source->lock);
+        pthread_cond_destroy(&source->cond);
+        printf("🧹 频道 %s:%d 已销毁\n", source->mcast_ip, source->mcast_port);
+        free(source);
     }
-    pthread_mutex_unlock(&channel_map_lock);
+    pthread_mutex_unlock(&channel_lock);
 }
 
 /* ========================================================================
  * 客户端管理
  * ======================================================================== */
-static client_node_t *client_create(channel_t *ch, int fd) {
-    client_node_t *c = calloc(1, sizeof(client_node_t));
+static client_conn_t *client_create(stream_source_t *source, int fd, int epfd) {
+    client_conn_t *c = calloc(1, sizeof(client_conn_t));
     if (!c) return NULL;
     c->fd = fd;
-    c->parent = ch;
+    c->epfd = epfd;
     c->active = 1;
+    c->source = source;
 
-    pthread_mutex_lock(&ch->clients.lock);
-    if (ch->clients.tail) {
-        ch->clients.tail->next = c;
-        c->prev = ch->clients.tail;
-        ch->clients.tail = c;
-    } else {
-        ch->clients.head = ch->clients.tail = c;
-    }
-    ch->clients.count++;
-    pthread_mutex_unlock(&ch->clients.lock);
-
+    pthread_mutex_lock(&source->lock);
+    c->next_conn = source->clients;
+    source->clients = c;
+    source->client_count++;
+    pthread_mutex_unlock(&source->lock);
     return c;
 }
 
-static void client_remove(client_node_t *c) {
+static void client_remove(client_conn_t *c) {
     if (!c) return;
-    channel_t *ch = c->parent;
-    if (!ch) {
-        free(c);
-        return;
+    stream_source_t *source = c->source;
+    if (source) {
+        pthread_mutex_lock(&source->lock);
+        client_conn_t **pp = &source->clients;
+        while (*pp) {
+            if (*pp == c) { *pp = c->next_conn; source->client_count--; break; }
+            pp = &(*pp)->next_conn;
+        }
+        pthread_mutex_unlock(&source->lock);
     }
-    pthread_mutex_lock(&ch->clients.lock);
-    if (c->prev) c->prev->next = c->next;
-    if (c->next) c->next->prev = c->prev;
-    if (ch->clients.head == c) ch->clients.head = c->next;
-    if (ch->clients.tail == c) ch->clients.tail = c->prev;
-    ch->clients.count--;
-    pthread_mutex_unlock(&ch->clients.lock);
-
-    if (c->fd >= 0) {
-        shutdown(c->fd, SHUT_RDWR);
-        close(c->fd);
-    }
+    if (c->fd >= 0) { epoll_ctl(c->epfd, EPOLL_CTL_DEL, c->fd, NULL); shutdown(c->fd, SHUT_RDWR); close(c->fd); }
     free(c);
-}
-
-/* ========================================================================
- * UDP 接收线程（每频道一个）
- * ======================================================================== */
-static void *udp_receiver_thread(void *arg) {
-    channel_t *ch = (channel_t *)arg;
-    uint8_t pkt[2048];
-
-    printf("📡 频道 [%s:%d] 数据接收线程已启动\n", ch->mcast_ip, ch->mcast_port);
-
-    while (!ch->cleanup) {
-        ssize_t n = recv(ch->mcast_fd, pkt, sizeof(pkt), 0);
-        if (n <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(1000);
-                continue;
-            }
-            printf("📡 频道 [%s:%d] 接收错误: %s\n", ch->mcast_ip, ch->mcast_port, strerror(errno));
-            break;
-        }
-
-        const uint8_t *payload = pkt;
-        size_t payload_len = (size_t)n;
-        uint16_t rtp_seq = 0;
-        int is_rtp = 0;
-
-        /* RTP 头检测 */
-        if (n > 12 && (pkt[0] & 0xC0) == 0x80) {
-            is_rtp = 1;
-            rtp_seq = ((uint16_t)pkt[2] << 8) | pkt[3];
-            int cc = pkt[0] & 0x0F;
-            size_t offset = 12 + cc * 4;
-            if ((pkt[0] & 0x10) && (size_t)n >= offset + 4) {
-                offset += 4 + ((((int)pkt[offset + 2] << 8) | pkt[offset + 3]) * 4);
-            }
-            if (offset < (size_t)n && pkt[offset] == 0x47) {
-                payload = pkt + offset;
-                payload_len = (size_t)n - offset;
-            }
-        }
-
-        pthread_mutex_lock(&ch->lock);
-
-        if (is_rtp) {
-            reorder_insert_packet(&ch->reorder, ch, rtp_seq, payload, payload_len);
-        } else {
-            ring_buffer_write(&ch->ring, payload, payload_len);
-            pthread_cond_broadcast(&ch->cond);
-        }
-
-        /* 智能起播检查 */
-        if (ts_has_pusi(payload, payload_len)) {
-            client_node_t *cli = ch->clients.head;
-            while (cli) {
-                if (!cli->iframe_locked) {
-                    cli->iframe_locked = 1;
-                }
-                cli = cli->next;
-            }
-        }
-
-        pthread_mutex_unlock(&ch->lock);
-    }
-
-    return NULL;
 }
 
 /* ========================================================================
  * TCP 发送线程（每客户端一个）
  * ======================================================================== */
 static void *tcp_sender_thread(void *arg) {
-    client_node_t *c = (client_node_t *)arg;
-    channel_t *ch = c->parent;
-    char http_header[256];
+    client_conn_t *c = (client_conn_t *)arg;
+    stream_source_t *source = c->source;
+    char header[256];
 
     /* 发送 HTTP 响应头 */
-    int header_len = snprintf(http_header, sizeof(http_header),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: video/mp2t\r\n"
-        "Connection: close\r\n"
-        "Server: rtp2http/4.0\r\n"
-        "\r\n");
-    send(c->fd, http_header, header_len, MSG_NOSIGNAL);
+    int hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\n");
+    send(c->fd, header, hlen, MSG_NOSIGNAL);
     c->headers_sent = 1;
-    printf("👤 客户端 [fd=%d] 已发送 HTTP 响应头，等待 I 帧...\n", c->fd);
 
     /* 等待 I 帧 */
-    while (!c->iframe_locked && c->active) {
-        usleep(5000);
-        if (c->close_requested) goto exit_thread;
+    while (!c->iframe_found && c->active) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10000000};
+        nanosleep(&ts, NULL);
     }
 
-    printf("👤 客户端 [fd=%d] 已锁定 I 帧，开始发送数据\n", c->fd);
+    while (c->active) {
+        const uint8_t *p1, *p2; size_t l1, l2;
+        size_t avail = ring_buffer_readable(&source->ring, &p1, &l1, &p2, &l2);
+        if (avail == 0) { usleep(2000); continue; }
 
-    while (c->active && !c->close_requested) {
-        const uint8_t *ptr1, *ptr2;
-        size_t len1, len2;
-        size_t avail = ring_buffer_get_read_ptr(&ch->ring, &ptr1, &len1, &ptr2, &len2);
-
-        if (avail == 0) {
-            usleep(2000);
-            continue;
-        }
-
-        size_t to_send = avail > CLIENT_READ_CHUNK ? CLIENT_READ_CHUNK : avail;
-        struct iovec iov[2];
-        int iovcnt = 0;
-
-        if (to_send <= len1) {
-            iov[0].iov_base = (void *)ptr1;
-            iov[0].iov_len = to_send;
-            iovcnt = 1;
-        } else {
-            iov[0].iov_base = (void *)ptr1;
-            iov[0].iov_len = len1;
-            iov[1].iov_base = (void *)ptr2;
-            iov[1].iov_len = to_send - len1;
-            iovcnt = 2;
-        }
+        size_t to_send = avail > SEND_CHUNK_SIZE ? SEND_CHUNK_SIZE : avail;
+        struct iovec iov[2]; int iovcnt = 0;
+        if (to_send <= l1) { iov[0].iov_base = (void *)p1; iov[0].iov_len = to_send; iovcnt = 1; }
+        else { iov[0].iov_base = (void *)p1; iov[0].iov_len = l1;
+               iov[1].iov_base = (void *)p2; iov[1].iov_len = to_send - l1; iovcnt = 2; }
 
         ssize_t sent = writev(c->fd, iov, iovcnt);
-        if (sent > 0) {
-            ring_buffer_consume(&ch->ring, (size_t)sent);
-        } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            usleep(1000);
-            continue;
-        } else {
-            printf("👤 客户端 [fd=%d] 发送错误: %s\n", c->fd, strerror(errno));
-            break;
-        }
+        if (sent > 0) ring_buffer_consume(&source->ring, (size_t)sent);
+        else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { usleep(1000); continue; }
+        else break;
     }
 
-exit_thread:
-    printf("⏹ 客户端 [fd=%d] 线程退出\n", c->fd);
     c->active = 0;
     client_remove(c);
-    channel_unref(ch);
+    channel_unref(source, c->epfd);
     return NULL;
-}
-
-/* ========================================================================
- * HTTP 请求处理
- * ======================================================================== */
-static void handle_http_request(int epoll_fd, int client_fd) {
-    char req[2048];
-    ssize_t n = recv(client_fd, req, sizeof(req) - 1, 0);
-    if (n <= 0) {
-        close(client_fd);
-        return;
-    }
-    req[n] = '\0';
-
-    char target_ip[64];
-    int target_port;
-
-    if (sscanf(req, "GET /rtp/%63[^:]:%d", target_ip, &target_port) == 2) {
-        printf("👤 新连接：rtp://%s:%d (fd=%d)\n", target_ip, target_port, client_fd);
-
-        set_tcp_optimized(client_fd);
-
-        channel_t *ch = channel_find_or_create(target_ip, target_port, epoll_fd);
-        if (!ch) {
-            const char *err = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
-            send(client_fd, err, strlen(err), MSG_NOSIGNAL);
-            close(client_fd);
-            return;
-        }
-
-        client_node_t *cli = client_create(ch, client_fd);
-        if (!cli) {
-            channel_unref(ch);
-            close(client_fd);
-            return;
-        }
-
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, tcp_sender_thread, cli) != 0) {
-            perror("pthread_create");
-            client_remove(cli);
-            channel_unref(ch);
-            close(client_fd);
-            return;
-        }
-        pthread_detach(tid);
-
-        /* 为新频道启动 UDP 接收线程 */
-        if (ch->refcount == 1) {
-            pthread_create(&tid, NULL, udp_receiver_thread, ch);
-            pthread_detach(tid);
-        }
-    } else {
-        const char *resp = "HTTP/1.1 400 Bad Request\r\n\r\n";
-        send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
-        close(client_fd);
-    }
 }
 
 /* ========================================================================
  * 主事件循环
  * ======================================================================== */
-int main(void) {
+int main(int argc, char *argv[]) {
+    int port = DEFAULT_PORT;
+    if (argc >= 3 && strcmp(argv[1], "-p") == 0) port = atoi(argv[2]);
+
     signal(SIGPIPE, SIG_IGN);
+    buffer_pool_init(&g_pool, BUFFER_POOL_SIZE);
 
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
-        perror("epoll_create1");
-        return 1;
-    }
-
+    int epfd = epoll_create1(0);
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket");
-        return 1;
-    }
-
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
-    struct sockaddr_in srv = {0};
-    srv.sin_family = AF_INET;
-    srv.sin_port = htons(HTTP_PORT);
-    srv.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(server_fd, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
-        perror("bind");
-        return 1;
-    }
-
-    if (listen(server_fd, SOMAXCONN) < 0) {
-        perror("listen");
-        return 1;
-    }
-
+    struct sockaddr_in srv = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = INADDR_ANY};
+    bind(server_fd, (struct sockaddr *)&srv, sizeof(srv));
+    listen(server_fd, SOMAXCONN);
     set_nonblocking(server_fd);
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = server_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+    struct epoll_event ev = {.events = EPOLLIN, .data.fd = server_fd};
+    epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
 
     struct epoll_event events[MAX_EVENTS];
 
-    const char *iface = getenv("MCAST_IFACE") ? getenv("MCAST_IFACE") : "eth0";
-    printf("🚀 rtp2http v5.0 启动 (接口: %s, 端口: %d)\n", iface, HTTP_PORT);
-    printf("   缓冲区: %d MB | TCP 发送缓冲: %d MB | UDP 接收缓冲: %d MB\n",
-           RING_BUF_SIZE / (1024 * 1024), TCP_SNDBUF_SIZE / (1024 * 1024), UDP_RCVBUF_SIZE / (1024 * 1024));
-    printf("   重排窗口: %d 包 | 超时: %d ms | 强制冲刷: %d ms\n",
-           REORDER_SLOTS, REORDER_DROP_TIMEOUT_MS, REORDER_FORCE_FLUSH_MS);
+    printf("🚀 rtp2httpd 启动 (端口: %d, 缓冲池: %d x %dB, 重排窗口: %d)\n",
+           port, BUFFER_POOL_SIZE, BUFFER_SIZE, REORDER_SLOTS);
 
     while (1) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 100);
-        if (nfds < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
+        int n = epoll_wait(epfd, events, MAX_EVENTS, 100);
+        if (n < 0) { if (errno == EINTR) continue; break; }
 
-        for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == server_fd) {
-                while (1) {
-                    int client_fd = accept(server_fd, NULL, NULL);
-                    if (client_fd < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        break;
+        for (int i = 0; i < n; i++) {
+            int fd = events[i].data.fd;
+
+            /* 新连接 */
+            if (fd == server_fd) {
+                int cli_fd = accept(server_fd, NULL, NULL);
+                if (cli_fd < 0) continue;
+                set_nonblocking(cli_fd);
+                int nodelay = 1, sndbuf = TCP_SNDBUF_SIZE;
+                setsockopt(cli_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+                setsockopt(cli_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+                char req[2048] = {0};
+                recv(cli_fd, req, sizeof(req) - 1, 0);
+                char ip[64]; int mport;
+                if (sscanf(req, "GET /rtp/%63[^:]:%d", ip, &mport) != 2) {
+                    close(cli_fd); continue;
+                }
+
+                stream_source_t *src = channel_find_or_create(ip, mport, epfd);
+                if (!src) { close(cli_fd); continue; }
+
+                client_conn_t *cli = client_create(src, cli_fd, epfd);
+                if (!cli) { channel_unref(src, epfd); close(cli_fd); continue; }
+
+                pthread_t tid;
+                pthread_create(&tid, NULL, tcp_sender_thread, cli);
+                pthread_detach(tid);
+            }
+            /* 组播数据接收 */
+            else {
+                /* 查找 fd 对应的频道 */
+                stream_source_t *src = NULL;
+                for (int j = 0; j < CHANNEL_HASH_SIZE; j++) {
+                    stream_source_t *ch = channel_table[j];
+                    while (ch) {
+                        if (ch->mcast_sock == fd) { src = ch; break; }
+                        ch = ch->hash_next;
                     }
-                    handle_http_request(epoll_fd, client_fd);
+                    if (src) break;
+                }
+                if (!src) continue;
+
+                /* 批量读取 */
+                for (int k = 0; k < 256; k++) {
+                    buffer_ref_t *buf = buffer_pool_alloc(&g_pool);
+                    if (!buf) break;
+                    ssize_t nr = recv(fd, buf->data, BUFFER_SIZE, 0);
+                    if (nr <= 0) { buffer_ref_put(&g_pool, buf); break; }
+                    buf->data_size = nr;
+
+                    pthread_mutex_lock(&src->lock);
+                    const uint8_t *payload; size_t plen; uint16_t seq;
+                    int type = rtp_get_payload(buf->data, nr, &payload, &plen, &seq);
+                    if (type == 1) {
+                        buf->data_offset = payload - buf->data;
+                        buf->data_size = plen;
+                        reorder_insert(&src->reorder, src, buf, seq);
+                    } else if (type == 0) {
+                        ring_buffer_write(&src->ring, payload, plen);
+                        buffer_ref_put(&g_pool, buf);
+                        pthread_cond_broadcast(&src->cond);
+                    } else { buffer_ref_put(&g_pool, buf); }
+
+                    /* I 帧检测 */
+                    if (ts_has_pusi(payload, plen)) {
+                        client_conn_t *cl = src->clients;
+                        while (cl) { cl->iframe_found = 1; cl = cl->next_conn; }
+                    }
+                    pthread_mutex_unlock(&src->lock);
                 }
             }
         }
     }
 
     close(server_fd);
-    close(epoll_fd);
+    close(epfd);
     return 0;
 }
