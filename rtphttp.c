@@ -20,6 +20,7 @@
  * L. HTTP 请求 recv 安全
  * M. SIGPIPE 崩溃
  * N. fd 越界保护
+ * O. 修正所有字符串换行与非法字符，确保可编译
  *
  * 编译：gcc -O3 -march=native -pthread -o rtp2http rtphttp_v2_fixed.c
  */
@@ -272,8 +273,7 @@ void *tcp_sender(void *arg) {
 
 /* 创建组播 socket 并加入指定组播组 */
 static int create_mcast_socket(const char *ip, int port, struct ip_mreqn *mreq_out) {
-    printf("   加入组播 %s:%d ...
-", ip, port);
+    printf("   加入组播 %s:%d ...\n", ip, port);
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
@@ -316,8 +316,7 @@ static int create_mcast_socket(const char *ip, int port, struct ip_mreqn *mreq_o
 
     set_nonblocking(fd);
 
-    printf("   组播 socket 创建成功，fd=%d
-", fd);
+    printf("   组播 socket 创建成功，fd=%d\n", fd);
     return fd;
 }
 
@@ -348,14 +347,12 @@ int main(void) {
 
     const char *iface = getenv("MCAST_IFACE") ? : "eth0";
 
-    printf("🚀 4K 极限稳定代理启动！
-");
-    printf("   端口: %d | 接口: %s | 环形缓冲: %dMB
-", HTTP_PORT, iface, RING_BUF_SIZE / 1024 / 1024);
-    printf("   UDP 接收缓冲: %dMB | TCP 发送缓冲: %dMB
-", UDP_RCVBUF_SIZE / 1024 / 1024, TCP_SNDBUF_SIZE / 1024 / 1024);
-    printf("   重排窗口: %d 包 | 批量读取: 256 包
-", REORDER_SLOTS);
+    printf("🚀 4K 极限稳定代理启动！\n");
+    printf("   端口: %d | 接口: %s | 环形缓冲: %dMB\n",
+           HTTP_PORT, iface, RING_BUF_SIZE / 1024 / 1024);
+    printf("   UDP 接收缓冲: %dMB | TCP 发送缓冲: %dMB\n",
+           UDP_RCVBUF_SIZE / 1024 / 1024, TCP_SNDBUF_SIZE / 1024 / 1024);
+    printf("   重排窗口: %d 包 | 批量读取: 256 包\n", REORDER_SLOTS);
 
     while (1) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -374,23 +371,20 @@ int main(void) {
                     close(cli_fd);
                     continue;
                 }
-                req[r] = '�';
+                req[r] = '\0';
 
                 char target_ip[64];
                 int target_port;
 
                 if (sscanf(req, "GET /rtp/%63[^:]:%d", target_ip, &target_port) == 2) {
-                    printf("👤 新连接：rtp://%s:%d | 等待起播...
-", target_ip, target_port);
+                    printf("👤 新连接：rtp://%s:%d | 等待起播...\n", target_ip, target_port);
 
+                    /* 修复：send 字符串必须单行或显式换行 */
                     send(cli_fd,
-                         "HTTP/1.1 200 OK
-"
-                         "Content-Type: video/mp2t
-"
-                         "Connection: close
-
-",
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: video/mp2t\r\n"
+                         "Connection: close\r\n"
+                         "\r\n",
                          64,
                          0);
 
@@ -449,8 +443,7 @@ int main(void) {
                     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ch->mcast_fd, &ev);
 
                 } else {
-                    printf("❌ 请求解析失败: %s
-", req);
+                    printf("❌ 请求解析失败: %s\n", req);
                     close(cli_fd);
                 }
 
