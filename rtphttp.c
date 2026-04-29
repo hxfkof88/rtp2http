@@ -2,15 +2,16 @@
  * rtphttp_v2.c — IPTV 组播转 HTTP 代理（4K 极限优化版）
  *
  * 相对 v1 新增优化：
- *  A. 智能起播：检测 MPEG-TS I 帧边界，不再死等固定字节数
- *  B. RTP 序列号重排缓冲：消除网络乱序导致的花屏
- *  C. 双 buffer 乒乓：接收路径几乎无锁，消除 mutex 争用卡顿
- *  D. SO_RCVBUF 扩至 8MB：抗 36Mbps 峰值码率突发
- *  E. TS 188 字节对齐写入：防止写入撕裂导致花屏
- *  F. 发送线程改用非阻塞 + 独立背压检测：writev 阻塞不再持有锁
+ * A. 智能起播：检测 MPEG-TS I 帧边界，不再死等固定字节数
+ * B. RTP 序列号重排缓冲：消除网络乱序导致的花屏
+ * C. 双 buffer 乒乓：接收路径几乎无锁，消除 mutex 争用卡顿
+ * D. SO_RCVBUF 扩至 8MB：抗 36Mbps 峰值码率突发
+ * E. TS 188 字节对齐写入：防止写入撕裂导致花屏
+ * F. 发送线程改用非阻塞 + 独立背压检测：writev 阻塞不再持有锁
+ * G. [修复] 支持多网卡/VLAN 环境下的精确 IGMP 加组 (ip_mreqn)
  *
- * 编译：gcc -O2 -o rtphttp rtphttp_v2.c -lpthread
- * 运行：MCAST_IFACE=eth0 ./rtphttp
+ * 编译：gcc -O2 -o rtp2http rtphttp_v2.c -lpthread
+ * 运行：MCAST_IFACE=eth0.45 ./rtp2http
  */
 
 #include <stdio.h>
@@ -101,7 +102,7 @@ typedef struct {
     int              epoll_fd;
 
     /* 组播信息（断线时 DROP_MEMBERSHIP 用） */
-    struct ip_mreq   mreq;
+    struct ip_mreqn  mreq;   /* 修改: 支持指定网络接口 index 的 ip_mreqn */
 
     /* ── 环形缓冲区（兜底路径，双 buffer 满时使用） ── */
     uint8_t         *ring_buf;
@@ -396,7 +397,7 @@ done:
  * 创建组播 socket
  * ══════════════════════════════════════════════════════════════ */
 static int create_mcast_socket(const char *ip, int port,
-                               struct ip_mreq *mreq_out)
+                               struct ip_mreqn *mreq_out) /* 修改: 接收 ip_mreqn 指针 */
 {
     in_addr_t mcast_addr = inet_addr(ip);
     if (mcast_addr == INADDR_NONE) {
@@ -430,9 +431,17 @@ static int create_mcast_socket(const char *ip, int port,
         fprintf(stderr, "⚠  SO_BINDTODEVICE %s 失败（需 root）: %s\n",
                 iface, strerror(errno));
 
-    struct ip_mreq mreq = {0};
+    /* 修改: 使用 ip_mreqn 结构体，强制指定网卡 ifindex 加入组播 */
+    struct ip_mreqn mreq = {0};
     mreq.imr_multiaddr.s_addr = mcast_addr;
-    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    mreq.imr_address.s_addr   = htonl(INADDR_ANY);
+    mreq.imr_ifindex          = if_nametoindex(iface);
+
+    if (mreq.imr_ifindex == 0) {
+        fprintf(stderr, "❌ 找不到网卡接口: %s\n", iface);
+        close(fd); return -1;
+    }
+
     if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
         perror("IP_ADD_MEMBERSHIP"); close(fd); return -1;
     }
